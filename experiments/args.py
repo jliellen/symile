@@ -3,6 +3,7 @@ Defines functions for processing command-line arguments for main.py, test.py,
 and symile/experiments/data_processing/binary_xor/informations.py.
 """
 import argparse
+import math
 from pathlib import Path
 
 from utils import str_to_bool
@@ -34,7 +35,7 @@ def parse_args_main():
     # first parse only the --experiment argument
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--experiment", type=str,
-                        choices=["binary_xor", "symile_m3", "symile_mimic"],
+                        choices=["binary_xor", "symile_m3", "symile_mimic", "symile_bdda"],
                         required=True,
                         help="Which experiment is being run.")
     args, remaining_argv = parser.parse_known_args()
@@ -53,6 +54,8 @@ def parse_args_main():
                         help="Check val every n train epochs.")
     parser.add_argument("--ckpt_save_dir", type=Path,
                         help="Where to save model checkpoints.")
+    parser.add_argument("--save_dir", type=Path,
+                        help="Directory for training artifacts and logs.")
     parser.add_argument("--d", type=int,
                         help="Dimensionality used by the linear projection heads \
                               of all three encoders.")
@@ -155,6 +158,46 @@ def parse_args_main():
     elif args.experiment == "symile_mimic":
         parser.add_argument("--pretrained", type=str_to_bool, default=False,
                             help="Whether to pretrained encoders for CXR and ECG.")
+    ### SYMILE-BDDA ARGS ###
+    elif args.experiment == "symile_bdda":
+        parser.set_defaults(
+            batch_sz_train=32,
+            batch_sz_val=32,
+            batch_sz_test=32,
+            check_val_every_n_epoch=1,
+            ckpt_save_dir=Path("checkpoints"),
+            save_dir=Path("runs/bdda_toy"),
+            d=128,
+            data_dir=Path("./data"),
+            drop_last=False,
+            negative_sampling="n",
+            epochs=1,
+            lr=1e-3,
+            weight_decay=0.0,
+            logit_scale_init=math.log(1 / 0.07),
+        )
+        parser.add_argument("--camera_base_channels", type=int, default=64,
+                            help="Base number of channels for camera convolutional backbone.")
+        parser.add_argument("--camera_num_blocks", type=int, default=4,
+                            help="Number of convolutional blocks in the camera backbone.")
+        parser.add_argument("--camera_dropout", type=float, default=0.1,
+                            help="Dropout probability applied after camera convolutional blocks.")
+        parser.add_argument("--gaze_base_channels", type=int, default=48,
+                            help="Base number of channels for gaze convolutional backbone.")
+        parser.add_argument("--gaze_num_blocks", type=int, default=4,
+                            help="Number of convolutional blocks in the gaze backbone.")
+        parser.add_argument("--gaze_dropout", type=float, default=0.1,
+                            help="Dropout probability applied after gaze convolutional blocks.")
+        parser.add_argument("--gps_dim", type=int, default=4,
+                            help="Dimensionality of the GPS vectors.")
+        parser.add_argument("--gps_hidden_dims", type=int, nargs="+", default=[256, 128],
+                            help="Hidden layer sizes for the GPS MLP projection.")
+        parser.add_argument("--gps_dropout", type=float, default=0.1,
+                            help="Dropout probability inside the GPS projection MLP.")
+        parser.add_argument("--max_samples_per_split", type=int, default=None,
+                            help="Optional cap on the number of samples loaded from each split.")
+        parser.add_argument("--num_workers", type=int, default=0,
+                            help="DataLoader worker count for BDDA runs (use 0 to disable multiprocessing).")
 
     all_args = parser.parse_args(remaining_argv)
 
@@ -168,7 +211,7 @@ def parse_args_test():
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--experiment", type=str,
-                        choices = ["symile_m3", "symile_mimic"],
+                        choices = ["symile_m3", "symile_mimic", "symile_bdda"],
                         help="Which experiment is being run.")
 
     ### ARGUMENTS COMMON TO BOTH EXPERIMENTS ###
