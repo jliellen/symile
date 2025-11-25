@@ -39,6 +39,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
+import torchvision.transforms.functional as TF
 from torchvision.models import ResNet50_Weights, resnet50
 from transformers import AutoModel, AutoTokenizer
 
@@ -93,6 +94,7 @@ class PSITriadDataset(Dataset):
         traj_steps: int,
         text_max_len: int,
         traj_stats: Optional[Dict[str, torch.Tensor]] = None,
+        split: str = "train",
     ):
         self.samples = _load_manifest(manifest_path)
         if len(self.samples) == 0:
@@ -104,14 +106,16 @@ class PSITriadDataset(Dataset):
         self.context_scale = context_scale
         self.traj_steps = traj_steps
         self.text_max_len = text_max_len
+        self.split = split
 
-        self.transform = transforms.Compose(
-            [
-                transforms.Resize((image_size, image_size)),
-                transforms.ToTensor(),
-                transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
-            ]
-        )
+        # Base normalization for everything
+        self.normalize = transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)
+
+        # Augmentation transforms (Color only, spatial is handled in __getitem__)
+        self.color_aug = transforms.Compose([
+            transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1),
+            transforms.RandomGrayscale(p=0.2),
+        ])
 
         self.traj_stats = traj_stats or self._compute_traj_stats()
 
@@ -155,7 +159,9 @@ class PSITriadDataset(Dataset):
 
     def _compute_traj_stats(self) -> Dict[str, torch.Tensor]:
         deltas = []
-        for sample in self.samples:
+        # Sample a subset if dataset is too large to speed up stat computation
+        sample_subset = self.samples[:5000] if len(self.samples) > 5000 else self.samples
+        for sample in sample_subset:
             traj = self._load_trajectory(sample)
             deltas.append(self._relative_displacements(traj))
         stacked = torch.cat(deltas, dim=0)
@@ -164,7 +170,8 @@ class PSITriadDataset(Dataset):
         std = torch.clamp(std, min=1e-6)
         return {"mean": mean, "std": std}
 
-    def _load_image(self, sample: Dict[str, Any]) -> torch.Tensor:
+    def _load_image_pil(self, sample: Dict[str, Any]) -> Image.Image:
+        """Returns the PIL image cropped to context, but NOT converted to tensor yet."""
         frame_path = self.data_root / sample["frame_path"]
         img = Image.open(frame_path).convert("RGB")
 
@@ -175,7 +182,7 @@ class PSITriadDataset(Dataset):
             bbox = traj[-1].tolist() if traj.shape[1] == 4 else [0, 0, img.width, img.height]
 
         cropped = _context_crop(img, bbox, self.context_scale, self.image_size)
-        return self.transform(cropped)
+        return cropped
 
     def _tokenize_text(self, text: str) -> Dict[str, torch.Tensor]:
         encoded = self.tokenizer(
@@ -193,17 +200,41 @@ class PSITriadDataset(Dataset):
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         sample = self.samples[idx]
 
-        image = self._load_image(sample)
-        traj = self._relative_displacements(self._load_trajectory(sample))
-        traj = (traj - self.traj_stats["mean"]) / self.traj_stats["std"]
+        # 1. Load Data
+        image_pil = self._load_image_pil(sample)
+        raw_traj = self._load_trajectory(sample)
+        traj_tensor = self._relative_displacements(raw_traj)
+        
+        # 2. Augmentation (Syncing Image and Trajectory)
+        if self.split == "train":
+            # A. Color Augmentation (does not affect trajectory)
+            image_pil = self.color_aug(image_pil)
+            
+            # B. Horizontal Flip (affects trajectory X coordinates)
+            if random.random() < 0.5:
+                image_pil = TF.hflip(image_pil)
+                # Negate X displacements (dx) -> index 0
+                traj_tensor[:, 0] = -traj_tensor[:, 0]
+
+        # 3. Final Tensor Conversion
+        # Ensure correct size (ColorJitter keeps size, but crop might have varied if we added it)
+        # Here we just ensure it's resized back to target if needed (already handled by _context_crop, but safe to ensure)
+        image_pil = image_pil.resize((self.image_size, self.image_size))
+        image_tensor = TF.to_tensor(image_pil)
+        image_tensor = self.normalize(image_tensor)
+
+        # 4. Trajectory Normalization
+        traj_norm = (traj_tensor - self.traj_stats["mean"]) / self.traj_stats["std"]
+
+        # 5. Text
         text = self._tokenize_text(sample["text"])
 
         label = sample.get("label", 0)
         sample_id = sample.get("sample_id", str(idx))
 
         return {
-            "image": image,
-            "trajectory": traj,
+            "image": image_tensor,
+            "trajectory": traj_norm,
             "text": text,
             "label": torch.tensor(label, dtype=torch.float32),
             "sample_id": sample_id,
@@ -228,6 +259,7 @@ class PSITriadDataModule(pl.LightningDataModule):
             context_scale=self.args.context_scale,
             traj_steps=self.args.traj_steps,
             text_max_len=self.args.text_max_len,
+            split="train"  # Enable augmentation
         )
 
         traj_stats = self.train_ds.traj_stats
@@ -241,6 +273,7 @@ class PSITriadDataModule(pl.LightningDataModule):
             traj_steps=self.args.traj_steps,
             text_max_len=self.args.text_max_len,
             traj_stats=traj_stats,
+            split="val"  # Disable augmentation
         )
 
         if self.args.test_manifest and Path(self.args.test_manifest).exists():
@@ -254,6 +287,7 @@ class PSITriadDataModule(pl.LightningDataModule):
                     traj_steps=self.args.traj_steps,
                     text_max_len=self.args.text_max_len,
                     traj_stats=traj_stats,
+                    split="test"  # Disable augmentation
                 )
             except RuntimeError:
                 self.test_ds = None
@@ -386,34 +420,63 @@ class SymilePSIModel(pl.LightningModule):
     def configure_optimizers(self):
         return torch.optim.AdamW(self.parameters(), lr=self.args.lr, weight_decay=self.args.weight_decay)
 
-    def _retrieval_acc(self, r_v: torch.Tensor, r_s: torch.Tensor, r_t: torch.Tensor, logit_scale_exp: torch.Tensor):
-        logits = zeroshot_retrieval_logits(r_v, [r_s, r_t], logit_scale_exp, self.args.loss_fn)
+    def _compute_one_way_acc(self, target: torch.Tensor, queries: List[torch.Tensor], logit_scale_exp: torch.Tensor):
+        """Helper to compute accuracy for a specific target given query modalities."""
+        logits = zeroshot_retrieval_logits(target, queries, logit_scale_exp, self.args.loss_fn)
         labels = torch.arange(logits.shape[0], device=logits.device)
         pred = torch.argmax(logits, dim=1)
         return (pred == labels).float().mean()
 
     def training_step(self, batch, batch_idx):
         r_v, r_s, r_t, logit_scale_exp = self(batch)
+        
+        # 1. Calculate Training Loss (This optimizes the joint space for ALL tasks)
         loss = self.loss_fn(r_v, r_s, r_t, logit_scale_exp, self.args.negative_sampling)
-        acc = self._retrieval_acc(r_v, r_s, r_t, logit_scale_exp)
+
+        # 2. Calculate accuracy for the primary task (Image Retrieval) for progress bar
+        acc_image = self._compute_one_way_acc(r_v, [r_s, r_t], logit_scale_exp)
 
         self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, sync_dist=False)
-        self.log("train_acc", acc, on_step=True, on_epoch=True, prog_bar=True, sync_dist=False)
+        self.log("train_acc", acc_image, on_step=True, on_epoch=True, prog_bar=True, sync_dist=False)
         self.log("logit_scale_exp", logit_scale_exp, on_step=True, prog_bar=True, sync_dist=False)
         return loss
 
     def validation_step(self, batch, batch_idx):
         r_v, r_s, r_t, logit_scale_exp = self(batch)
         loss = self.loss_fn(r_v, r_s, r_t, logit_scale_exp, self.args.negative_sampling)
-        acc = self._retrieval_acc(r_v, r_s, r_t, logit_scale_exp)
+        
+        # --- NEW: Compute accuracies for ALL 3 TASKS ---
+        # 1. Given Text + Traj -> Find Image (Original)
+        acc_v = self._compute_one_way_acc(target=r_v, queries=[r_s, r_t], logit_scale_exp=logit_scale_exp)
+        
+        # 2. Given Image + Traj -> Find Text (New Request)
+        acc_t = self._compute_one_way_acc(target=r_t, queries=[r_v, r_s], logit_scale_exp=logit_scale_exp)
+        
+        # 3. Given Image + Text -> Find Trajectory (New Request)
+        acc_s = self._compute_one_way_acc(target=r_s, queries=[r_v, r_t], logit_scale_exp=logit_scale_exp)
+
+        # Log everything clearly
         self.log("val_loss", loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
-        self.log("val_acc", acc, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+        self.log("val_acc_image", acc_v, on_step=False, on_epoch=True, prog_bar=False, sync_dist=True)
+        self.log("val_acc_text", acc_t, on_step=False, on_epoch=True, prog_bar=False, sync_dist=True)
+        self.log("val_acc_traj", acc_s, on_step=False, on_epoch=True, prog_bar=False, sync_dist=True)
+        
+        # Keep 'val_acc' as the average of all three for a general health check
+        self.log("val_acc", (acc_v + acc_t + acc_s) / 3, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+        
         return loss
 
     def test_step(self, batch, batch_idx):
         r_v, r_s, r_t, logit_scale_exp = self(batch)
-        acc = self._retrieval_acc(r_v, r_s, r_t, logit_scale_exp)
-        self.log("test_acc", acc, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+        
+        # Compute all 3 accuracies for the test set
+        acc_v = self._compute_one_way_acc(target=r_v, queries=[r_s, r_t], logit_scale_exp=logit_scale_exp)
+        acc_t = self._compute_one_way_acc(target=r_t, queries=[r_v, r_s], logit_scale_exp=logit_scale_exp)
+        acc_s = self._compute_one_way_acc(target=r_s, queries=[r_v, r_t], logit_scale_exp=logit_scale_exp)
+
+        self.log("test_acc_image", acc_v, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+        self.log("test_acc_text", acc_t, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+        self.log("test_acc_traj", acc_s, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
 
     def on_train_end(self) -> None:
         run_info = {"args": self.args, "final_logit_scale": float(self.logit_scale.exp().item())}
