@@ -175,13 +175,16 @@ class PSITriadDataset(Dataset):
         frame_path = self.data_root / sample["frame_path"]
         img = Image.open(frame_path).convert("RGB")
 
-        if "bbox" in sample:
-            bbox = sample["bbox"]
+        if "crop_coords" in sample:
+            x1, y1, x2, y2 = sample["crop_coords"]
+            cropped = img.crop((x1, y1, x2, y2))
         else:
-            traj = self._load_trajectory(sample)
-            bbox = traj[-1].tolist() if traj.shape[1] == 4 else [0, 0, img.width, img.height]
-
-        cropped = _context_crop(img, bbox, self.context_scale, self.image_size)
+            if "bbox" in sample:
+                bbox = sample["bbox"]
+            else:
+                traj = self._load_trajectory(sample)
+                bbox = traj[-1].tolist() if traj.shape[1] == 4 else [0, 0, img.width, img.height]
+            cropped = _context_crop(img, bbox, self.context_scale, self.image_size)
         return cropped
 
     def _tokenize_text(self, text: str) -> Dict[str, torch.Tensor]:
